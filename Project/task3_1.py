@@ -51,7 +51,7 @@ def save_generation_data(generation, population, fitness_scores, rewards, mutati
     """
     Guarda os dados de uma geração inteira num CSV separado por seed.
     """
-    folder = f"results_seed_{seed}"
+    folder = f"results_seed_{seed}/{controller_name}_{scenario}"
     os.makedirs(folder, exist_ok=True)
 
     filename = os.path.join(folder, f"generation_{generation}.csv")
@@ -149,7 +149,7 @@ def evaluate_fitness(robot_structure, view=False):
     try:
         if not is_connected(robot_structure):
             print("Robô desconectado!")
-            return -100.0  # Penalizar robôs desconectados
+            return -100.0, -100.0  # Penalizar robôs desconectados
   
         connectivity = get_full_connectivity(robot_structure)
         
@@ -284,7 +284,7 @@ def evaluate_fitness(robot_structure, view=False):
         
     except (ValueError, IndexError, TypeError) as e:
         print(f"Erro na função de fitness: {e}")
-        return -100.0
+        return -100.0, -100.0  # Penalizar robôs desconectados ou com erro
     
 
     
@@ -731,6 +731,7 @@ def main_teste():
                     random.seed(RUN_SEED)
                     np.random.seed(RUN_SEED)
                     
+                    
                     print(f"\nExecução {seed+1}/5 com seed {RUN_SEED}")
                     start = time.time()
                     best_robot, best_fitness = evolve()
@@ -754,14 +755,13 @@ def main_teste():
                         filename=f'final_results_summary.xlsx'
                     )
                     
-                    if seed == 0 or best_fitness > final_results[-1]['best_fitness'] if final_results else True:
-                        utils.create_gif(
+                    utils.create_gif(
                             best_robot, 
                             filename=f'{controller.__name__}_{scenario}_seed{seed}.gif', 
                             scenario=scenario, 
                             steps=STEPS, 
                             controller=controller
-                        )
+                    )
                     
                     final_results.append({
                         'scenario': scenario,
