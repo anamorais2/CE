@@ -1,25 +1,25 @@
+
 import numpy as np
 import pandas as pd
 import random
 import gymnasium as gym
-from evogym.envs import *
+from evogym.envs import *    
 from evogym import EvoViewer, get_full_connectivity
 from neural_controller import *
 import utils
 import torch
 import os
 import csv
-import time
 from datetime import datetime
 
 # === PARÂMETROS ===
-NUM_GENERATIONS = 10
+NUM_GENERATIONS = 100
 POP_SIZE = 50
+SIGMA_INIT = 0.2
 STEPS = 500
-SEEDS = [42, 43, 44, 45, 46]
 SCENARIOS = ['DownStepper-v0', 'ObstacleTraverser-v0']
-FM = 0.8   # Fator de mutação
-CR = 0.9  # Crossover rate
+SEEDS = [51,52,53,54,55]
+
 
 # === DEFINIÇÃO DO ROBÔ ===
 robot_structure = np.array([
@@ -32,54 +32,70 @@ robot_structure = np.array([
 connectivity = get_full_connectivity(robot_structure)
 
 # === FUNÇÕES AUXILIARES ===
-def flatten_weights(weights):
-    return np.concatenate([w.flatten() for w in weights])
+def flatten_weights(weights_list):
+    """Transforma uma lista de arrays de pesos em um vetor unidimensional"""
+    return np.concatenate([w.flatten() for w in weights_list])
 
-def unflatten_weights(flat_weights, model):
-    new_weights = []
-    pointer = 0
+def structure_weights(flat_weights, model):
+    """Transforma um vetor unidimensional em uma lista de arrays com as formas originais"""
+    structured_weights = []
+    current_idx = 0
+    
     for param in model.parameters():
-        shape = param.data.shape
-        size = param.data.numel()
-        segment = flat_weights[pointer:pointer + size]
-        new_weights.append(segment.reshape(shape))
-        pointer += size
-    return new_weights
+        shape = param.shape
+        param_size = np.prod(shape)
+        param_weights = flat_weights[current_idx:current_idx + param_size]
+        structured_weights.append(param_weights.reshape(shape))
+        current_idx += param_size
+        
+    return structured_weights
 
 def save_generation_data(generation, population, fitness_scores, scenario, controller_name, seed, parameters):
+    """
+    Salva os dados de cada geração em um arquivo CSV
+    """
     folder = f"results_seed_{seed}/{controller_name}_{scenario}"
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"generation_{generation}.csv")
 
     with open(filename, mode='w', newline='') as file:
         writer = csv.writer(file)
+
+        # Cabeçalho com metadados da run (apenas na primeira geração)
         if generation == 0:
             writer.writerow(["# ALGORITHM", parameters.get("algorithm", "DE")])
             for key, value in parameters.items():
                 writer.writerow([f"# {key}", value])
 
+        # Cabeçalho dos dados por indivíduo
         writer.writerow(["Index", "Fitness", "Reward", "Weights"])
-        for i, (weights, fitness) in enumerate(zip(population, fitness_scores)):
-            weights_str = str(weights)
-            writer.writerow([i, -fitness, fitness, weights_str])
 
+        for i, (weights, fitness) in enumerate(zip(population, fitness_scores)):
+            weights_str = str(weights)  # Converter pesos para string para armazenar no CSV
+            writer.writerow([i, -fitness, fitness, weights_str])
+            
 def save_results_to_excel(controller, best_fitness, scenario, population_size, num_generations, execution_time, seed, controller_weights, filename='task3_2_Results_Complete.xlsx'):
+    """
+    Salva os resultados em um arquivo Excel, incluindo os pesos e bias do controlador
+    """
+    # Converter os pesos e bias para uma string 
     weights_str = str(controller_weights)
+
     new_data = {
         'Scenario': [scenario],
         'Controller': [controller.__name__],
         'Population Size': [population_size],
         'Number of Generations': [num_generations],
-        'Mutation Factor (F)': [FM],
-        'Crossover Rate (CR)': [CR],
         'Best Fitness': [best_fitness],
         'Execution Time (s)': [execution_time],
         'Seed': [seed],
-        'Algorithm': ["Differential Evolution"],
-        'Controller Weights': [weights_str]
+        'Algorithm': ["DE"],
+        'Controller Weights': [weights_str]  # Adicionando os pesos e bias
     }
 
     new_df = pd.DataFrame(new_data)
+
+    # Se o arquivo já existe, adiciona os novos dados
     if os.path.exists(filename):
         existing_df = pd.read_excel(filename)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -89,217 +105,198 @@ def save_results_to_excel(controller, best_fitness, scenario, population_size, n
     combined_df.to_excel(filename, index=False)
     print(f"Resultados salvos em {filename}")
 
+
 # === FUNÇÃO DE AVALIAÇÃO ===
-def evaluate_fitness(flat_weights, scenario, brain, view=False):
-    weights = unflatten_weights(flat_weights, brain)
-    set_weights(brain, weights)
+def evaluate_fitness(weights,scenario, brain, view=False):
+        set_weights(brain, weights)  # Load weights into the network
+        env = gym.make(scenario, max_episode_steps=STEPS, body=robot_structure, connections=connectivity)
+        sim = env
+        viewer = EvoViewer(sim)
+        viewer.track_objects('robot')
+        state = env.reset()[0]  # Get initial state
+        t_reward = 0
+        for t in range(STEPS):  
+            # Update actuation before stepping
+            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)  # Convert to tensor
+            action = brain(state_tensor).detach().numpy().flatten() # Get action
+            if view:
+                viewer.render('screen') 
+            state, reward, terminated, truncated, info = env.step(action)
+            t_reward += reward
+            if terminated or truncated:
+                env.reset()
+                break
 
-    env = gym.make(scenario, max_episode_steps=STEPS, body=robot_structure, connections=connectivity)
-    sim = env.sim
-    viewer = EvoViewer(sim)
-    viewer.track_objects('robot')
+        viewer.close()
+        env.close()
+        return t_reward 
 
-    state = env.reset()[0]
-    total_reward = 0
-       
-    action_size = sim.get_dim_action_space('robot') 
+# ----- FUNÇÕES PARA A EVOLUÇÃO DO CONTROLADOR (CMA-ES) -----
 
-    initial_pos = sim.object_pos_at_time(0, 'robot')
-    positions = [initial_pos]
-    max_distance = 0
-    stability_penalty = 0
-    energy_usage = 0
-    backward_steps = 0
-    stuck_steps = 0  # Novo contador de passos parados
+def initialize_controller_population(input_size, output_size, size=POP_SIZE):
+    base_model = NeuralController(input_size, output_size)
+    flat_weights = flatten_weights(get_weights(base_model))
+    dim = len(flat_weights)
+
+    population = []
+    for _ in range(size):
+        # Inicializa em torno de valores pequenos
+        individual = np.random.normal(0, SIGMA_INIT, dim)
+        structured = structure_weights(individual, base_model)
+        population.append(structured)
+
+    return population, base_model
+
+def flatten_weights(weights_list):
+    """Transforma uma lista de arrays de pesos em um vetor unidimensional"""
+    return np.concatenate([w.flatten() for w in weights_list])
+
+def structure_weights(flat_weights, model):
+    """Transforma um vetor unidimensional em uma lista de arrays com as formas originais"""
+    structured_weights = []
+    current_idx = 0
     
-    for t in range(STEPS):  
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        action = brain(state_tensor).detach().numpy().flatten()
+    for param in model.parameters():
+        shape = param.shape
+        param_size = np.prod(shape)
+        param_weights = flat_weights[current_idx:current_idx + param_size]
+        structured_weights.append(param_weights.reshape(shape))
+        current_idx += param_size
         
-        if view:
-            viewer.render('screen')
+    return structured_weights
 
-        ob, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
+def evolve_controllers(population, scenario, fitnesses, base_model, F=0.5, CR=0.7):
+    new_population = []
+    dim = len(flatten_weights(population[0]))
 
-        current_pos = sim.object_pos_at_time(t, 'robot')
-        positions.append(current_pos)
+    flat_population = [flatten_weights(ind) for ind in population]
 
-        distance_traveled = np.mean(current_pos[0]) - np.mean(initial_pos[0])
-        max_distance = max(max_distance, distance_traveled)
+    for i in range(len(population)):
+        # Seleciona 3 indivíduos distintos
+        indices = list(range(len(population)))
+        indices.remove(i)
+        a, b, c = random.sample(indices, 3)
 
-        if len(positions) > 1:
-            delta = np.mean(current_pos[0]) - np.mean(positions[-2][0])
-            if delta < -0.001:
-                backward_steps += 1
-            elif abs(delta) < 0.001:
-                stuck_steps += 1
+        # Mutação
+        mutant = flat_population[a] + F * (flat_population[b] - flat_population[c])
 
-        orientation = sim.object_orientation_at_time(t, 'robot')
-        adjusted_orientation = (orientation + np.pi) % (2 * np.pi) - np.pi
-        if abs(adjusted_orientation) > 0.5:
-            stability_penalty += 0.5
+        # Crossover
+        target = flat_population[i]
+        trial = np.copy(target)
+        for j in range(dim):
+            if random.random() < CR:
+                trial[j] = mutant[j]
 
-        energy_usage += float(np.sum(np.abs(action)))
+        # Avaliação
+        trial_structured = structure_weights(trial, base_model)
+        set_weights(base_model, trial_structured)
+        trial_fitness = evaluate_fitness(trial_structured, scenario, base_model, view=False)
 
-        if terminated or truncated:
-            break
-        
-    viewer.close()
+        # Seleção
+        if trial_fitness >= fitnesses[i]:
+            new_population.append(trial_structured)
+        else:
+            new_population.append(population[i])
+
+    return new_population
+
+
+# ----- FUNÇÕES DE AVALIAÇÃO -----
+
+def get_input_output_sizes(scenario):
+    """Obtém as dimensões de entrada/saída do ambiente"""
+    robot_structure = np.array([
+    [1, 3, 1, 0, 0],
+    [4, 1, 3, 2, 2],
+    [3, 4, 4, 4, 4],
+    [3, 0, 0, 3, 2],
+    [0, 0, 0, 0, 2]
+    ])
+    # Cria uma estrutura mínima para inicializar o ambiente
+    connectivity = get_full_connectivity(robot_structure)
+    
+    # Criar o ambiente
+    env = gym.make(scenario, max_episode_steps=STEPS, body=robot_structure, connections=connectivity)
+    
+    # Obter dimensões de entrada e saída
+    input_size = env.observation_space.shape[0]
+    output_size = env.action_space.shape[0]
+    
+    # Fechar o ambiente após obter as dimensões
     env.close()
-        
-    # Limiares por cenário
-    if scenario == 'Walker-v0':
-        MAX_THEORETICAL_DISTANCE = STEPS * 0.1  
-        MAX_THEORETICAL_REWARD = STEPS * 0.1
-    elif scenario == 'BridgeWalker-v0':
-        MAX_THEORETICAL_DISTANCE = STEPS * 0.08 
-        MAX_THEORETICAL_REWARD = STEPS * 0.08
-    else:
-        MAX_THEORETICAL_DISTANCE = STEPS * 0.1
-        MAX_THEORETICAL_REWARD = STEPS * 0.1
-            
-    MAX_STABILITY_PENALTY = STEPS * 0.5
-    MAX_ENERGY_USAGE = STEPS * action_size * 2
-    MAX_STUCK_STEPS = STEPS * 0.3  # Considera 30% parado como um mau sinal
-        
-    norm_distance = min(max_distance / MAX_THEORETICAL_DISTANCE, 1.0)
-    norm_reward = min(total_reward / MAX_THEORETICAL_REWARD, 1.0)
-    norm_stability = min(stability_penalty / MAX_STABILITY_PENALTY, 1.0)
-    norm_energy = min(energy_usage / MAX_ENERGY_USAGE, 1.0)
-    norm_stuck = min(stuck_steps / MAX_STUCK_STEPS, 1.0)
-
-    if scenario == 'DownStepper-v0':
-        backward_penalty = min(backward_steps * 0.1, 1.0)
-        fitness = (
-            norm_distance * 2.0 +  # Peso maior para a distância (descer degraus)
-            norm_reward * 1.0 -  # Considerando recompensa por movimento bem-sucedido
-            norm_stability * 1.0 -  # Penalização maior por instabilidade, pois o cenário envolve degraus
-            backward_penalty * 0.2 -  # Penalizar movimento para trás, mas com peso moderado
-            norm_energy * 0.2 - # Menor penalização de energia, pois o movimento envolve subidas/descidas
-            norm_stuck * 0.5 
-        )
-
-    elif scenario == 'ObstacleTraverser-v0':
-        backward_penalty = min(backward_steps * 0.2, 2.0)
-        fitness = (
-            norm_distance * 2.0 +
-            norm_reward * 1.0 -
-            norm_stability * 1.0 - 
-            backward_penalty * 1.0 -
-            norm_energy * 0.2 -
-            norm_stuck * 0.5 
-        )
-
-    return -fitness # Because DE minimizes the fitness function, we return the negative value to maximize it.
-
-def de(fobj, bounds, mut=0.8, crossp=0.7, popsize=20, its=1000):
-    dimensions = len(bounds)
-    pop = np.random.rand(popsize, dimensions)
-    min_b, max_b = np.asarray(bounds).T
-    diff = np.fabs(min_b - max_b)
-    pop_denorm = min_b + pop * diff
-    fitness = np.asarray([fobj(ind) for ind in pop_denorm])
-    best_idx = np.argmin(fitness)
-    best = pop_denorm[best_idx]
-    for i in range(its):
-        for j in range(popsize):
-            idxs = [idx for idx in range(popsize) if idx != j]
-            a, b, c = pop[np.random.choice(idxs, 3, replace = False)]
-            mutant = np.clip(a + mut * (b - c), 0, 1)
-            cross_points = np.random.rand(dimensions) < crossp
-            if not np.any(cross_points):
-                cross_points[np.random.randint(0, dimensions)] = True
-            trial = np.where(cross_points, mutant, pop[j])
-            trial_denorm = min_b + trial * diff
-            f = fobj(trial_denorm)
-            if f < fitness[j]:
-                fitness[j] = f
-                pop[j] = trial
-                if f < fitness[best_idx]:
-                    best_idx = j
-                    best = trial_denorm
-        yield best, fitness[best_idx]
-
+    
+    print(f"Input Size: {input_size}, Output Size: {output_size}")
+    
+    return input_size, output_size
 
 def run_de(seed, scenario):
     np.random.seed(seed)
     random.seed(seed)
+    torch.manual_seed(seed)
 
-    env = gym.make(scenario, max_episode_steps=STEPS, body=robot_structure, connections=connectivity)
-    input_size = env.observation_space.shape[0]
-    output_size = env.action_space.shape[0]
-    brain = NeuralController(input_size, output_size)
+    input_size, output_size = get_input_output_sizes(scenario)
+    population, base_model = initialize_controller_population(input_size, output_size, size=POP_SIZE)
 
-    initial_weights_structured = get_weights(brain)
-    initial_weights = flatten_weights(initial_weights_structured)
-    DIM = len(initial_weights)
-
-    # === Limites dos pesos (ex: todos [-1, 1]) ===
-    bounds = [(-1.0, 1.0)] * DIM
-
-    # === Função de fitness parcial ===
-    from functools import partial
-    fitness_function = partial(evaluate_fitness, scenario=scenario, brain=brain, view=False)
-
-    # === Executar DE ===
+    best_global_fitness = float('-inf')
+    best_global_solution = None
     start = time.time()
-    best = None
-    best_fitness = float('inf')
-    
 
-    for generation, (candidate, fitness) in enumerate(de(fitness_function, bounds, mut=FM, crossp=CR, popsize=POP_SIZE, its=NUM_GENERATIONS)): 
-        
-        print(f"Generation {generation+1}/{NUM_GENERATIONS} | Best fitness: {fitness:.2f}")
+    for generation in range(NUM_GENERATIONS):
+        fitnesses = []
+        for individual_weights in population:
+            set_weights(base_model, individual_weights)
+            fitness = evaluate_fitness(individual_weights, scenario, base_model, view=False)
+            fitnesses.append(fitness)
 
-        # Salvar dados da geração (a população não é salva individualmente aqui, mas pode ser modificada se necessário)
+            if fitness > best_global_fitness:
+                best_global_fitness = fitness
+                best_global_solution = flatten_weights(individual_weights)
+
+        population = evolve_controllers(population, scenario, fitnesses, base_model)
+
         parameters = {
             "algorithm": "Differential Evolution",
             "population_size": POP_SIZE,
             "num_generations": NUM_GENERATIONS,
-            "mutation_factor_F": FM,
-            "crossover_rate_CR": CR,
             "scenario": scenario,
             "steps": STEPS,
             "seed": seed,
             "controller_name": "NeuralController"
         }
 
-        # Apenas salvamos o melhor indivíduo por geração aqui
-        save_generation_data(generation, [candidate], [fitness], scenario, "NeuralController", seed, parameters)
+        save_generation_data(generation, population, fitnesses, scenario, "NeuralController", seed, parameters)
+        print(f"Geração {generation + 1}/{NUM_GENERATIONS} | Best fitness: {best_global_fitness:.2f}")
 
-        if fitness < best_fitness:
-            best_fitness = fitness
-            best = candidate
+    best_weights = structure_weights(best_global_solution, base_model)
+    set_weights(base_model, best_weights)
 
     execution_time = time.time() - start
+    print(f"Tempo total: {execution_time:.2f} segundos")
+    print(f"Best fitness: {best_global_fitness:.2f}")
 
-    # === Aplicar pesos finais no cérebro ===
-    best_weights = unflatten_weights(best, brain)
-    set_weights(brain, best_weights)
+    controller_weights = flatten_weights(get_weights(base_model))
 
-    print(f"Execution time: {execution_time:.2f} seconds")
-    print(f"Best fitness: {-best_fitness:.2f}")
-
-    controller_weights = flatten_weights(get_weights(brain))
     save_results_to_excel(
         controller=NeuralController,
-        best_fitness=-best_fitness,
+        best_fitness=best_global_fitness,
         scenario=scenario,
         population_size=POP_SIZE,
         num_generations=NUM_GENERATIONS,
         execution_time=execution_time,
         seed=seed,
-        controller_weights=controller_weights
+        controller_weights=controller_weights,
+        filename='task3_2_Results_Complete.xlsx'
     )
 
     for _ in range(10):
-        visualize_policy(best_weights, scenario, brain)
+        visualize_policy(best_weights, scenario, base_model)
 
-    utils.create_gif(robot_structure, filename=f'DE_{scenario}_seed{seed}.gif', scenario=scenario, steps=STEPS, controller=brain)
+    utils.create_gif(robot_structure, filename=f'DE_{scenario}_seed{seed}.gif', scenario=scenario, steps=STEPS, controller=base_model)
 
 
-# === VISUALIZAÇÃO ===
+
+
+# === VISUALIZAÇÃO FINAL ===
 def visualize_policy(weights, scenario, brain):
     set_weights(brain, weights)
 
@@ -309,7 +306,7 @@ def visualize_policy(weights, scenario, brain):
     viewer.track_objects('robot')
     state = env.reset()[0]
 
-    for _ in range(STEPS):
+    for t in range(STEPS):
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         action = brain(state_tensor).detach().numpy().flatten()
         viewer.render('screen')
@@ -319,8 +316,9 @@ def visualize_policy(weights, scenario, brain):
 
     viewer.close()
     env.close()
+    
 
-
+#Acrescentar o modo de 5 execuções de cada 100 runs
 # === EXECUÇÃO PRINCIPAL ===
 def main():
     mode = input("Selecione o modo (1=Run único, 2=5 execuções por cenário): ")
@@ -342,8 +340,8 @@ def main():
     elif mode == '2':
        for scenario in SCENARIOS:
            for seed in SEEDS:
-               print(f"\n--- Executando CMA-ES para o cenário {scenario} com a seed {seed} ---")
-               run_de(seed, scenario)
+                print(f"\n--- Executando DE para o cenário {scenario} com a seed {seed} ---")
+                run_de(seed, scenario)
     else:
         print("Modo inválido.")
 
