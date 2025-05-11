@@ -12,7 +12,6 @@ import os
 import csv
 from datetime import datetime
 
-# === PARÂMETROS ===
 NUM_GENERATIONS = 100
 POP_SIZE = 50
 SIGMA_INIT = 0.2
@@ -21,7 +20,6 @@ SCENARIOS = ['DownStepper-v0', 'ObstacleTraverser-v0']
 SEEDS = [51,52,53,54,55]
 
 
-# === DEFINIÇÃO DO ROBÔ ===
 robot_structure = np.array([
     [1, 3, 1, 0, 0],
     [4, 1, 3, 2, 2],
@@ -29,9 +27,10 @@ robot_structure = np.array([
     [3, 0, 0, 3, 2],
     [0, 0, 0, 0, 2]
 ])
+
 connectivity = get_full_connectivity(robot_structure)
 
-# === FUNÇÕES AUXILIARES ===
+# --- Funções auxiliares de manipulação de pesos ---
 def flatten_weights(weights_list):
     """Transforma uma lista de arrays de pesos em um vetor unidimensional"""
     return np.concatenate([w.flatten() for w in weights_list])
@@ -50,11 +49,12 @@ def structure_weights(flat_weights, model):
         
     return structured_weights
 
+# --- Função para salvar os dados de cada geração ---
 def save_generation_data(generation, population, fitness_scores, scenario, controller_name, seed, parameters):
     """
     Salva os dados de cada geração em um arquivo CSV
     """
-    folder = f"results_seed_{seed}/{controller_name}_{scenario}"
+    folder = f"results_seed_{seed}/{controller_name}_{scenario}_DE"
     os.makedirs(folder, exist_ok=True)
     filename = os.path.join(folder, f"generation_{generation}.csv")
 
@@ -74,6 +74,7 @@ def save_generation_data(generation, population, fitness_scores, scenario, contr
             weights_str = str(weights)  # Converter pesos para string para armazenar no CSV
             writer.writerow([i, -fitness, fitness, weights_str])
             
+# --- Função para salvar os resultados finais num Excel ---            
 def save_results_to_excel(controller, best_fitness, scenario, population_size, num_generations, execution_time, seed, controller_weights, filename='task3_2_Results_Complete.xlsx'):
     """
     Salva os resultados em um arquivo Excel, incluindo os pesos e bias do controlador
@@ -90,12 +91,11 @@ def save_results_to_excel(controller, best_fitness, scenario, population_size, n
         'Execution Time (s)': [execution_time],
         'Seed': [seed],
         'Algorithm': ["DE"],
-        'Controller Weights': [weights_str]  # Adicionando os pesos e bias
+        'Controller Weights': [weights_str]
     }
 
     new_df = pd.DataFrame(new_data)
 
-    # Se o arquivo já existe, adiciona os novos dados
     if os.path.exists(filename):
         existing_df = pd.read_excel(filename)
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -106,7 +106,7 @@ def save_results_to_excel(controller, best_fitness, scenario, population_size, n
     print(f"Resultados salvos em {filename}")
 
 
-# === FUNÇÃO DE AVALIAÇÃO ===
+# --- Função de Fitness ---
 def evaluate_fitness(weights,scenario, brain, view=False):
         set_weights(brain, weights)  # Load weights into the network
         env = gym.make(scenario, max_episode_steps=STEPS, body=robot_structure, connections=connectivity)
@@ -131,8 +131,7 @@ def evaluate_fitness(weights,scenario, brain, view=False):
         env.close()
         return t_reward 
 
-# ----- FUNÇÕES PARA A EVOLUÇÃO DO CONTROLADOR (CMA-ES) -----
-
+# ---- Funções de Inicialização e Evolução ----
 def initialize_controller_population(input_size, output_size, size=POP_SIZE):
     base_model = NeuralController(input_size, output_size)
     flat_weights = flatten_weights(get_weights(base_model))
@@ -146,24 +145,6 @@ def initialize_controller_population(input_size, output_size, size=POP_SIZE):
         population.append(structured)
 
     return population, base_model
-
-def flatten_weights(weights_list):
-    """Transforma uma lista de arrays de pesos em um vetor unidimensional"""
-    return np.concatenate([w.flatten() for w in weights_list])
-
-def structure_weights(flat_weights, model):
-    """Transforma um vetor unidimensional em uma lista de arrays com as formas originais"""
-    structured_weights = []
-    current_idx = 0
-    
-    for param in model.parameters():
-        shape = param.shape
-        param_size = np.prod(shape)
-        param_weights = flat_weights[current_idx:current_idx + param_size]
-        structured_weights.append(param_weights.reshape(shape))
-        current_idx += param_size
-        
-    return structured_weights
 
 def evolve_controllers(population, scenario, fitnesses, base_model, F=0.5, CR=0.7):
     new_population = []
@@ -201,8 +182,7 @@ def evolve_controllers(population, scenario, fitnesses, base_model, F=0.5, CR=0.
     return new_population
 
 
-# ----- FUNÇÕES DE AVALIAÇÃO -----
-
+# --- Função para obter as dimensões de entrada/saída do ambiente
 def get_input_output_sizes(scenario):
     """Obtém as dimensões de entrada/saída do ambiente"""
     robot_structure = np.array([
@@ -212,23 +192,22 @@ def get_input_output_sizes(scenario):
     [3, 0, 0, 3, 2],
     [0, 0, 0, 0, 2]
     ])
-    # Cria uma estrutura mínima para inicializar o ambiente
-    connectivity = get_full_connectivity(robot_structure)
     
-    # Criar o ambiente
+    connectivity = get_full_connectivity(robot_structure)
+
     env = gym.make(scenario, max_episode_steps=STEPS, body=robot_structure, connections=connectivity)
     
     # Obter dimensões de entrada e saída
     input_size = env.observation_space.shape[0]
     output_size = env.action_space.shape[0]
     
-    # Fechar o ambiente após obter as dimensões
     env.close()
     
     print(f"Input Size: {input_size}, Output Size: {output_size}")
     
     return input_size, output_size
 
+# --- Função principal para executar o algoritmo ---
 def run_de(seed, scenario):
     np.random.seed(seed)
     random.seed(seed)
@@ -253,7 +232,7 @@ def run_de(seed, scenario):
                 best_global_solution = flatten_weights(individual_weights)
 
         population = evolve_controllers(population, scenario, fitnesses, base_model)
-
+        
         parameters = {
             "algorithm": "Differential Evolution",
             "population_size": POP_SIZE,
@@ -263,7 +242,8 @@ def run_de(seed, scenario):
             "seed": seed,
             "controller_name": "NeuralController"
         }
-
+        
+        # Salvar os dados da geração
         save_generation_data(generation, population, fitnesses, scenario, "NeuralController", seed, parameters)
         print(f"Geração {generation + 1}/{NUM_GENERATIONS} | Best fitness: {best_global_fitness:.2f}")
 
@@ -275,7 +255,8 @@ def run_de(seed, scenario):
     print(f"Best fitness: {best_global_fitness:.2f}")
 
     controller_weights = flatten_weights(get_weights(base_model))
-
+ 
+    # Salvar os resultados num Excel
     save_results_to_excel(
         controller=NeuralController,
         best_fitness=best_global_fitness,
@@ -291,12 +272,10 @@ def run_de(seed, scenario):
     for _ in range(10):
         visualize_policy(best_weights, scenario, base_model)
 
-    utils.create_gif(robot_structure, filename=f'DE_{scenario}_seed{seed}.gif', scenario=scenario, steps=STEPS, controller=base_model)
+    utils.create_gif_to_task3_2(robot_structure, filename=f'DE_{scenario}_seed{seed}.gif', scenario=scenario, steps=STEPS, controller=base_model)
 
 
-
-
-# === VISUALIZAÇÃO FINAL ===
+# --- Visualização ---
 def visualize_policy(weights, scenario, brain):
     set_weights(brain, weights)
 
@@ -318,8 +297,7 @@ def visualize_policy(weights, scenario, brain):
     env.close()
     
 
-#Acrescentar o modo de 5 execuções de cada 100 runs
-# === EXECUÇÃO PRINCIPAL ===
+# --- Função principal ---
 def main():
     mode = input("Selecione o modo (1=Run único, 2=5 execuções por cenário): ")
 
